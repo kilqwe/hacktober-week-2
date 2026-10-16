@@ -91,7 +91,7 @@ jobs:
         continue-on-error: true
         run: |
           rc=0
-          python head/pr_diff.py base.json head.json --out comment.md ${MAX_INCREASE:+--fail-over "$MAX_INCREASE"} || rc=$?
+          python head/pr.py base.json head.json --out comment.md ${MAX_INCREASE:+--fail-over "$MAX_INCREASE"} || rc=$?
           cat comment.md >> "$GITHUB_STEP_SUMMARY"   # always visible in the run summary, even on fork PRs
           exit $rc
 
