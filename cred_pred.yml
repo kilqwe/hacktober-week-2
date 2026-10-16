@@ -3,7 +3,7 @@ name: Credit Burn Check
 on:
   pull_request:
     paths:
-      - "/"   
+      - "infra/**"   
 
 permissions:
   contents: read
