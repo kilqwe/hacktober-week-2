@@ -1,0 +1,121 @@
+name: Credit Burn Check
+
+on:
+  pull_request:
+    paths:
+      - "/"   
+
+permissions:
+  contents: read
+  pull-requests: write  
+
+concurrency:
+  group: cred-pred-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  estimate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      INFRACOST_API_KEY: ${{ secrets.INFRACOST_API_KEY }}
+      CREDITS: ${{ vars.CREDITS }}                  # remaining balance in USD (required)
+      CREDITS_EXPIRES: ${{ vars.CREDITS_EXPIRES }}  # e.g. 2027-06-30 (optional)
+      MAX_INCREASE: ${{ vars.CRED_MAX_INCREASE }}   # optional: fail PRs adding more than $X/mont
+      USE_LLM: ${{ vars.CRED_USE_LLM }}             # set to "true" to enable the Ollama advisor tip
+      MODEL: ${{ vars.CRED_MODEL || 'gemma2:2b' }}
+      OLLAMA_MODELS: ${{ github.workspace }}/.ollama-models
+
+    steps:
+      - name: Check configuration
+        run: |
+          if [ -z "$CREDITS" ]; then
+            echo "::error::Set the CREDITS repository variable (Settings > Secrets and variables > Actions > Variables)."
+            exit 1
+          fi
+          if [ -z "$INFRACOST_API_KEY" ]; then
+            echo "::warning::INFRACOST_API_KEY is not available (secret not set, or this is a fork PR). EC2/RDS will be unpriced."
+          fi
+
+      - uses: actions/checkout@v4
+        with: { path: head }
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -r head/requirements.txt
+
+      # Price lookups rarely change, so cache them between runs (saves API calls)
+      - uses: actions/cache@v4
+        with:
+          path: .price_cache.json
+          key: price-cache-${{ github.run_id }}
+          restore-keys: price-cache-
+
+      # Optional local model for the advisor tip 
+      # Off by default so the first run is fast. Numbers never depend on this step:
+      # if Ollama fails, the tool falls back to rule-based tips.
+      - uses: actions/cache@v4
+        if: env.USE_LLM == 'true'
+        with:
+          path: .ollama-models
+          key: ollama-${{ env.MODEL }}
+      - name: Start Ollama
+        if: env.USE_LLM == 'true'
+        continue-on-error: true
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+          sudo systemctl stop ollama 2>/dev/null || true
+          (nohup ollama serve > ollama.log 2>&1 &)
+          for i in $(seq 1 30); do curl -sf http://localhost:11434 > /dev/null && break; sleep 2; done
+          ollama pull "$MODEL"
+
+      - name: Estimate base branch
+        run: |
+          cat base/infra/*.tf > base.tf 2>/dev/null || true
+          python head/cred_pred.py --credits "$CREDITS" ${CREDITS_EXPIRES:+--expires "$CREDITS_EXPIRES"} \
+            --file base.tf --no-llm --json-out base.json --out base.md || echo '{}' > base.json
+
+      - name: Estimate PR branch
+        run: |
+          cat head/infra/*.tf > head.tf
+          if [ "$USE_LLM" = "true" ]; then LLM_ARGS="--model $MODEL"; else LLM_ARGS="--no-llm"; fi
+          python head/cred_pred.py --credits "$CREDITS" ${CREDITS_EXPIRES:+--expires "$CREDITS_EXPIRES"} \
+            --file head.tf $LLM_ARGS --json-out head.json --out head.md || echo '{}' > head.json
+
+      - name: Build comment
+        id: diff
+        continue-on-error: true
+        run: |
+          rc=0
+          python head/pr_diff.py base.json head.json --out comment.md ${MAX_INCREASE:+--fail-over "$MAX_INCREASE"} || rc=$?
+          cat comment.md >> "$GITHUB_STEP_SUMMARY"   # always visible in the run summary, even on fork PRs
+          exit $rc
+
+      # Fork PRs get a read-only token, so only post the comment for same-repo PRs
+      - name: Post or update PR comment
+        if: always() && hashFiles('comment.md') != '' && github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('comment.md', 'utf8');
+            const marker = '<!-- cred-pred-comment -->';
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+
+      - name: Enforce budget guard
+        if: always() && steps.diff.outcome == 'failure'
+        run: |
+          echo "::error::This PR raises credit-covered burn above the configured limit (CRED_MAX_INCREASE)."
+          exit 1

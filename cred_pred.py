@@ -1,16 +1,8 @@
-#!/usr/bin/env python3
 """
-cred_pred.py - predict how long your cloud credits will last.
-
-The LLM never does arithmetic or pricing:
-  * .tf / terraform plan .json are parsed by code; plain English goes through a local
-    Ollama model whose output is validated in Python.
-  * Dollar figures come from Infracost live pricing or labelled flat estimates.
-  * The LLM only writes the advisor tip, which is rejected if it invents numbers.
-
-  python cred_pred.py --credits 5000 --file main.tf --expires 2027-06-30
-  python cred_pred.py --credits 5000 --file plan.json --model qwen2.5:3b
-  python cred_pred.py --credits 5000 --describe "2 t3.medium, db.t3.small postgres, 1 NAT gateway"
+run format:
+    python cred_pred.py --credits 5000 --file main.tf --expires 2027-06-30
+    python cred_pred.py --credits 5000 --file plan.json --model qwen2.5:3b
+    python cred_pred.py --credits 5000 --describe "2 t3.medium, db.t3.small postgres, 1 NAT gateway"
 """
 from __future__ import annotations
 
@@ -33,6 +25,9 @@ INFRACOST_URL = "https://pricing.api.infracost.io/graphql"
 CACHE_TTL = 7 * 24 * 3600
 
 # Flat monthly estimates at us-east-1 rates (labelled "estimate" in the report)
+
+
+
 FLAT = {
     "nat_gateway": (0.045 * HOURS_PER_MONTH, "hourly only; $0.045/GB data processing not included"),
     "load_balancer": (0.0225 * HOURS_PER_MONTH, "hourly only; LCU usage not included"),
@@ -99,9 +94,12 @@ class Resource:
                 "price_source": self.price_source, "note": self.note}
 
 
-# ----------------------------------------------------------------------------
+
+
 # Value helpers. python-hcl2 keeps literal quotes on strings: '"t3.medium"'
-# ----------------------------------------------------------------------------
+
+
+
 def clean(v):
     if isinstance(v, str):
         v = v.strip()
@@ -135,9 +133,11 @@ def first_block(v) -> dict:
     return v if isinstance(v, dict) else {}
 
 
-# ----------------------------------------------------------------------------
+
 # Deterministic extraction (shared by .tf and plan JSON)
-# ----------------------------------------------------------------------------
+
+
+
 def components_for(rtype, name, cfg, region, qty, variables, warnings, skipped, addr=None) -> list[Resource]:
     """Turn one Terraform resource into priceable items (e.g. aws_instance -> EC2 + root volume)."""
     addr = addr or f"{rtype}.{name}"
@@ -265,9 +265,11 @@ def extract_from_plan(text, default_region, warnings, skipped) -> list[Resource]
     return out
 
 
-# ----------------------------------------------------------------------------
+
 # Local LLM (Ollama): plain-English extraction and the advisor tip
-# ----------------------------------------------------------------------------
+
+
+
 def ollama_generate(base_url, model, prompt, schema=None, timeout=180) -> str:
     payload = {"model": model, "prompt": prompt, "stream": False, "options": {"temperature": 0, "seed": 42}}
     if schema:
@@ -349,9 +351,14 @@ def extract_from_text(text, region, base_url, model, warnings) -> list[Resource]
     return out
 
 
-# ----------------------------------------------------------------------------
+
+
+
 # Pricing: Infracost live for EC2/RDS, labelled flat estimates for the rest
-# ----------------------------------------------------------------------------
+
+
+
+
 class Pricer:
     def __init__(self, api_key: str | None, cache_path: Path | None):
         self.api_key, self.cache_path, self.cache = api_key, cache_path, {}
@@ -452,9 +459,12 @@ class Pricer:
         raise RuntimeError("no on-demand price found (check instance type / region / engine)")
 
 
-# ----------------------------------------------------------------------------
+
+
 # Credit math: pure Python
-# ----------------------------------------------------------------------------
+
+
+
 def analyze_credits(credits: float, monthly: float, expires: date | None, today: date) -> dict:
     out = {"credits": credits, "monthly_covered": monthly, "expires": expires.isoformat() if expires else None,
            "runway_months": None, "runs_out": None, "months_to_expiry": None, "status": "no_cost",
@@ -477,9 +487,13 @@ def analyze_credits(credits: float, monthly: float, expires: date | None, today:
     return out
 
 
-# ----------------------------------------------------------------------------
+
+
+
 # Advisor: LLM tip guarded against invented numbers, with a rule-based fallback
-# ----------------------------------------------------------------------------
+
+
+
 TIPS = {
     "nat_gateway": "NAT gateways bill hourly plus per GB. For non-prod use one NAT instead of one per AZ, and add free S3/DynamoDB gateway VPC endpoints so that traffic skips the NAT.",
     "rds": "Your database is the top cost. Turn off Multi-AZ outside production, right-size the instance class, and stop dev databases overnight.",
@@ -563,9 +577,14 @@ def advisor_tip(items, credit_info, base_url, model, use_llm, warnings) -> tuple
     return fallback_tip(items), "rules"
 
 
-# ----------------------------------------------------------------------------
+
+
+
 # Report + CLI
-# ----------------------------------------------------------------------------
+
+
+
+
 def money(x) -> str:
     return "?" if x is None else f"${x:,.2f}"
 
