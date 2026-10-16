@@ -12,3 +12,5 @@ resource "aws_db_instance" "primary_db" {
   instance_class    = "db.r5.large"
   allocated_storage = 20
 }
+
+resource "aws_nat_gateway" "nat" {}
