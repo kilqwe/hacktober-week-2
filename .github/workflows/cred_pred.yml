@@ -77,14 +77,14 @@ jobs:
         run: |
           cat base/infra/*.tf > base.tf 2>/dev/null || true
           python head/cred_pred.py --credits "$CREDITS" ${CREDITS_EXPIRES:+--expires "$CREDITS_EXPIRES"} \
-            --file base.tf --no-llm --json-out base.json --out base.md || echo '{}' > base.json
+            --file base.tf --no-llm --json > base.json --out base.md || echo '{}' > base.json
 
       - name: Estimate PR branch
         run: |
           cat head/infra/*.tf > head.tf
           if [ "$USE_LLM" = "true" ]; then LLM_ARGS="--model $MODEL"; else LLM_ARGS="--no-llm"; fi
           python head/cred_pred.py --credits "$CREDITS" ${CREDITS_EXPIRES:+--expires "$CREDITS_EXPIRES"} \
-            --file head.tf $LLM_ARGS --json-out head.json --out head.md || echo '{}' > head.json
+            --file head.tf $LLM_ARGS --json > head.json --out head.md || echo '{}' > head.json
 
       - name: Build comment
         id: diff
