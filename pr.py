@@ -1,6 +1,6 @@
 """
-    pr_diff.py - Compare two `cred_pred.py --json` outputs and render a PR comment.
-    python pr_diff.py base.json head.json --out comment.md [--fail-over 100]
+    pr.py - Compare two `cred_pred.py --json` outputs and render a PR comment.
+    python pr.py base.json head.json --out comment.md [--fail-over 100]
 """
 import argparse
 import json

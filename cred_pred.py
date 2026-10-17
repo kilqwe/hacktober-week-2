@@ -5,7 +5,7 @@ run format:
     python cred_pred.py --credits 5000 --describe "2 t3.medium, db.t3.small postgres, 1 NAT gateway"
 """
 from __future__ import annotations
-
+ 
 import argparse
 import json
 import os
@@ -15,19 +15,23 @@ import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
-
+ 
 import requests
 from dotenv import load_dotenv
-
+ 
 HOURS_PER_MONTH = 730
 DAYS_PER_MONTH = 30.44
 INFRACOST_URL = "https://pricing.api.infracost.io/graphql"
 CACHE_TTL = 7 * 24 * 3600
-
+ 
+ 
+ 
+ 
 # Flat monthly estimates at us-east-1 rates (labelled "estimate" in the report)
-
-
-
+ 
+ 
+ 
+ 
 FLAT = {
     "nat_gateway": (0.045 * HOURS_PER_MONTH, "hourly only; $0.045/GB data processing not included"),
     "load_balancer": (0.0225 * HOURS_PER_MONTH, "hourly only; LCU usage not included"),
@@ -40,26 +44,34 @@ RDS_ENGINES = {"postgres": "PostgreSQL", "postgresql": "PostgreSQL", "mysql": "M
                "aurora-postgresql": "Aurora PostgreSQL", "aurora-mysql": "Aurora MySQL", "aurora": "Aurora MySQL"}
 KINDS = ["ec2", "rds", "ebs", "nat_gateway", "load_balancer", "elastic_ip", "eks_cluster"]
 INSTANCE_RE = re.compile(r"^[a-z][a-z0-9]*\d[a-z0-9-]*\.[a-z0-9]+$")
+ 
+ 
+ 
+ 
 # Terraform types that cost ~nothing. Other unrecognised aws_* types are reported as "not priced".
+ 
+ 
+ 
+ 
 FREE = ("aws_vpc", "aws_subnet", "aws_security_group", "aws_route", "aws_internet_gateway", "aws_iam",
         "aws_key_pair", "aws_network_acl", "aws_lb_listener", "aws_lb_target_group", "aws_alb_",
         "aws_db_subnet_group", "aws_db_parameter_group", "aws_eip_association", "aws_launch_template",
         "aws_cloudwatch_log_group", "aws_ssm_parameter", "aws_default_", "aws_volume_attachment",
         "aws_ebs_volume_attachment", "aws_main_route_table_association")
-
-
+ 
+ 
 def log(msg: str) -> None:
     print(msg, file=sys.stderr)  # stderr keeps --json output on stdout clean
-
-
+ 
+ 
 class FatalError(Exception):
     pass
-
-
+ 
+ 
 class LLMError(Exception):
     pass
-
-
+ 
+ 
 @dataclass
 class Resource:
     """One billable line item."""
@@ -75,11 +87,11 @@ class Resource:
     unit_monthly: float | None = None  # per unit; None = unknown
     price_source: str = "unknown"  # live | cache | estimate | unknown
     note: str = ""
-
+ 
     @property
     def monthly(self) -> float | None:
         return None if self.unit_monthly is None else self.unit_monthly * self.quantity
-
+ 
     @property
     def display_type(self) -> str:
         if self.kind in ("ebs", "rds_storage"):
@@ -87,27 +99,28 @@ class Resource:
                 return "size not set"
             return f"{self.size_gb} GB" + (f" {self.volume_type}" if self.kind == "ebs" else "")
         return self.instance_type or self.kind
-
+ 
     def to_dict(self) -> dict:
         return {"kind": self.kind, "name": self.name, "type": self.display_type, "region": self.region,
                 "quantity": self.quantity, "unit_monthly": self.unit_monthly, "monthly": self.monthly,
                 "price_source": self.price_source, "note": self.note}
-
-
-
-
+ 
+ 
+ 
+ 
 # Value helpers. python-hcl2 keeps literal quotes on strings: '"t3.medium"'
-
-
-
+ 
+ 
+ 
+ 
 def clean(v):
     if isinstance(v, str):
         v = v.strip()
         if len(v) > 1 and v[0] == v[-1] == '"':
             v = v[1:-1]
     return v
-
-
+ 
+ 
 def resolve(v, variables: dict):
     """Literal or simple var.x reference -> value; anything else -> None."""
     v = clean(v)
@@ -119,36 +132,38 @@ def resolve(v, variables: dict):
         if "${" in v or v.startswith(("var.", "local.", "data.", "module.")):
             return None
     return v
-
-
+ 
+ 
 def to_int(v, default=None):
     try:
         return int(float(clean(v)))
     except (TypeError, ValueError):
         return default
-
-
+ 
+ 
 def first_block(v) -> dict:
     v = v[0] if isinstance(v, list) and v else v
     return v if isinstance(v, dict) else {}
-
-
-
+ 
+ 
+ 
+ 
 # Deterministic extraction (shared by .tf and plan JSON)
-
-
-
+ 
+ 
+ 
+ 
 def components_for(rtype, name, cfg, region, qty, variables, warnings, skipped, addr=None) -> list[Resource]:
     """Turn one Terraform resource into priceable items (e.g. aws_instance -> EC2 + root volume)."""
     addr = addr or f"{rtype}.{name}"
-
+ 
     def get(key, default=None):
         v = resolve(cfg.get(key), variables)
         return default if v is None else v
-
+ 
     def res(kind, label=None, **kw):
         return Resource(kind, label or addr, region, qty, **kw)
-
+ 
     if rtype == "aws_instance":
         itype = get("instance_type")
         if not itype:
@@ -158,7 +173,7 @@ def components_for(rtype, name, cfg, region, qty, variables, warnings, skipped, 
         return [res("ec2", instance_type=str(itype)),
                 res("ebs", f"{addr} (root volume)", size_gb=to_int(resolve(root.get("volume_size"), variables), 8),
                     volume_type=str(resolve(root.get("volume_type"), variables) or "gp3"))]
-
+ 
     if rtype in ("aws_db_instance", "aws_rds_cluster_instance"):
         itype = get("instance_class")
         if not itype:
@@ -177,7 +192,7 @@ def components_for(rtype, name, cfg, region, qty, variables, warnings, skipped, 
             out.append(res("rds_storage", f"{addr} (storage)", size_gb=to_int(get("allocated_storage"), 0),
                            multi_az=multi))
         return out
-
+ 
     if rtype == "aws_ebs_volume":
         return [res("ebs", size_gb=to_int(get("size"), 0), volume_type=str(get("type", "gp3")))]
     simple = {"aws_nat_gateway": "nat_gateway", "aws_lb": "load_balancer", "aws_alb": "load_balancer",
@@ -189,8 +204,8 @@ def components_for(rtype, name, cfg, region, qty, variables, warnings, skipped, 
     if rtype.startswith("aws_") and not rtype.startswith(FREE):
         skipped.add(rtype)
     return []
-
-
+ 
+ 
 def extract_from_hcl(text, default_region, warnings, skipped) -> list[Resource]:
     try:
         import hcl2
@@ -202,7 +217,7 @@ def extract_from_hcl(text, default_region, warnings, skipped) -> list[Resource]:
         raise FatalError(f"Could not parse this Terraform file ({first_line}). The .tf parser does not support "
                          f"every Terraform feature. Run `terraform show -json plan.out > plan.json` and use "
                          f"--file plan.json instead.") from e
-
+ 
     variables = {clean(n): c["default"] for b in parsed.get("variable", []) for n, c in b.items()
                  if isinstance(c, dict) and "default" in c}
     region = default_region
@@ -214,7 +229,7 @@ def extract_from_hcl(text, default_region, warnings, skipped) -> list[Resource]:
                     region = r
                 else:
                     warnings.append(f"AWS provider region not resolvable; using {default_region}")
-
+ 
     if parsed.get("module"):
         warnings.append(f"{len(parsed['module'])} module block(s) are not expanded, so resources inside them are "
                         f"NOT counted. Use plan JSON (`terraform show -json`) for exact results.")
@@ -240,8 +255,8 @@ def extract_from_hcl(text, default_region, warnings, skipped) -> list[Resource]:
                         qty = 1
                 out += components_for(rtype, name, cfg, region, qty, variables, warnings, skipped)
     return out
-
-
+ 
+ 
 def extract_from_plan(text, default_region, warnings, skipped) -> list[Resource]:
     """`terraform show -json plan.out`: variables, modules, count and for_each are already expanded."""
     try:
@@ -254,7 +269,7 @@ def extract_from_plan(text, default_region, warnings, skipped) -> list[Resource]
         region = plan["configuration"]["provider_config"]["aws"]["expressions"]["region"]["constant_value"]
     except (KeyError, TypeError):
         region = default_region
-
+ 
     out: list[Resource] = []
     for rc in plan["resource_changes"]:
         change = rc.get("change", {})
@@ -263,13 +278,15 @@ def extract_from_plan(text, default_region, warnings, skipped) -> list[Resource]
         out += components_for(rc.get("type", ""), rc.get("name", ""), change["after"], region, 1, {},
                               warnings, skipped, addr=rc.get("address"))
     return out
-
-
-
+ 
+ 
+ 
+ 
 # Local LLM (Ollama): plain-English extraction and the advisor tip
-
-
-
+ 
+ 
+ 
+ 
 def ollama_generate(base_url, model, prompt, schema=None, timeout=180) -> str:
     payload = {"model": model, "prompt": prompt, "stream": False, "options": {"temperature": 0, "seed": 42}}
     if schema:
@@ -285,8 +302,8 @@ def ollama_generate(base_url, model, prompt, schema=None, timeout=180) -> str:
     if not r.ok:
         raise LLMError(f"Ollama error {r.status_code}: {r.text[:200]}")
     return r.json().get("response", "")
-
-
+ 
+ 
 INVENTORY_SCHEMA = {
     "type": "object",
     "properties": {"resources": {"type": "array", "items": {
@@ -303,8 +320,8 @@ _EX_OUT = {"resources": [
     {"kind": "rds", "instance_type": "db.r5.large", "engine": "mysql", "multi_az": True, "quantity": 1},
     {"kind": "ebs", "size_gb": 100, "quantity": 2},
     {"kind": "load_balancer", "quantity": 1}]}
-
-
+ 
+ 
 def extract_from_text(text, region, base_url, model, warnings) -> list[Resource]:
     """The model proposes an inventory; Python validates every entry before it is trusted."""
     prompt = (
@@ -320,7 +337,7 @@ def extract_from_text(text, region, base_url, model, warnings) -> list[Resource]
         items = json.loads(raw)["resources"]
     except (json.JSONDecodeError, KeyError, TypeError) as e:
         raise LLMError(f"Model returned unusable output: {raw[:200]!r}") from e
-
+ 
     out: list[Resource] = []
     for i, it in enumerate(items, 1):
         label, kind, qty = f"described[{i}]", it.get("kind"), to_int(it.get("quantity"), 1)
@@ -349,16 +366,15 @@ def extract_from_text(text, region, base_url, model, warnings) -> list[Resource]
                             multi_az=bool(it.get("multi_az")) if kind == "rds" else False,
                             size_gb=size if kind == "ebs" else 0))
     return out
-
-
-
-
-
+ 
+ 
+ 
+ 
 # Pricing: Infracost live for EC2/RDS, labelled flat estimates for the rest
-
-
-
-
+ 
+ 
+ 
+ 
 class Pricer:
     def __init__(self, api_key: str | None, cache_path: Path | None):
         self.api_key, self.cache_path, self.cache = api_key, cache_path, {}
@@ -367,11 +383,11 @@ class Pricer:
                 self.cache = json.loads(cache_path.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError):
                 pass
-
+ 
     def price(self, r: Resource) -> None:
         """Fill r.unit_monthly / price_source / note in place."""
         self._live(r) if r.kind in ("ec2", "rds") else self._estimate(r)
-
+ 
     def _estimate(self, r: Resource) -> None:
         if r.kind in FLAT:
             unit, note = FLAT[r.kind]
@@ -388,7 +404,7 @@ class Pricer:
         if r.region != "us-east-1":
             note = (note + "; " if note else "") + "us-east-1 rates, other regions differ"
         r.unit_monthly, r.price_source, r.note = round(unit, 2), "estimate", note
-
+ 
     def _live(self, r: Resource) -> None:
         if r.kind == "rds" and r.engine not in RDS_ENGINES:
             r.note = f"unsupported database engine '{r.engine}'"
@@ -417,7 +433,7 @@ class Pricer:
             except OSError:
                 pass
         r.unit_monthly, r.price_source = round(hourly * HOURS_PER_MONTH, 2), "live"
-
+ 
     def _query(self, r: Resource) -> float:
         if r.kind == "ec2":
             service, family = "AmazonEC2", "Compute Instance"
@@ -457,14 +473,15 @@ class Pricer:
                 except (TypeError, ValueError):
                     continue
         raise RuntimeError("no on-demand price found (check instance type / region / engine)")
-
-
-
-
+ 
+ 
+ 
+ 
 # Credit math: pure Python
-
-
-
+ 
+ 
+ 
+ 
 def analyze_credits(credits: float, monthly: float, expires: date | None, today: date) -> dict:
     out = {"credits": credits, "monthly_covered": monthly, "expires": expires.isoformat() if expires else None,
            "runway_months": None, "runs_out": None, "months_to_expiry": None, "status": "no_cost",
@@ -485,15 +502,15 @@ def analyze_credits(credits: float, monthly: float, expires: date | None, today:
             out.update(status="expires_first", wasted=round(credits - monthly * months_left, 2),
                        needed_monthly_to_use_all=round(credits / months_left, 2))
     return out
-
-
-
-
-
+ 
+ 
+ 
+ 
 # Advisor: LLM tip guarded against invented numbers, with a rule-based fallback
-
-
-
+ 
+ 
+ 
+ 
 TIPS = {
     "nat_gateway": "NAT gateways bill hourly plus per GB. For non-prod use one NAT instead of one per AZ, and add free S3/DynamoDB gateway VPC endpoints so that traffic skips the NAT.",
     "rds": "Your database is the top cost. Turn off Multi-AZ outside production, right-size the instance class, and stop dev databases overnight.",
@@ -503,28 +520,28 @@ TIPS = {
     "ebs": "Volumes bill whether or not they are attached. Delete orphaned volumes and move gp2 to gp3.",
     "elastic_ip": "Public IPv4 addresses are billed hourly. Release unused Elastic IPs.",
 }
-
-
+ 
+ 
 def fallback_tip(items: list[Resource]) -> str:
     return TIPS.get(items[0].kind, "Review your largest line item for right-sizing opportunities.") if items \
         else "No priced resources, so no tip."
-
-
+ 
+ 
 _FIGURE = re.compile(r"\$\s*(\d[\d,]*\.?\d*)|(\d[\d,]*\.?\d*)\s*(?:%|percent|dollars|usd|/mo\b|per month|a month)", re.I)
-
-
+ 
+ 
 def _norm(m: str) -> str:
     return m.rstrip(".,").replace(",", "")
-
-
+ 
+ 
 def _figures(tip: str) -> set[str]:
     """Money and percentage claims in the model's tip. Names like t4g/gp3/S3 and plain counts are ignored."""
     return {_norm(a or b) for a, b in _FIGURE.findall(tip)}
-
-
-_INSTANCE_MENTION = re.compile(r"\b(?:db\.)?[a-z]{1,3}\d[a-z0-9-]*\.(?:nano|micro|small|medium|large|\d*xlarge|metal)\b", re.I)
-
-
+ 
+ 
+_INSTANCE_MENTION = re.compile(r"\b(?:db\.)?[a-z]{1,3}\d[a-z0-9-]*\.(?:\d*x?(?:nano|micro|small|medium|large)|metal)\b", re.I)
+ 
+ 
 def _unknown_instance_types(tip: str, items) -> set[str]:
     """Instance types the tip names that are not in the user's inventory (e.g. an invented 'r5.medium')."""
     known = set()
@@ -533,8 +550,8 @@ def _unknown_instance_types(tip: str, items) -> set[str]:
             t = r.instance_type.lower()
             known |= {t, t.removeprefix("db.")}
     return {m.lower() for m in _INSTANCE_MENTION.findall(tip)} - known
-
-
+ 
+ 
 def advisor_tip(items, credit_info, base_url, model, use_llm, warnings) -> tuple[str, str]:
     """Returns (tip, source) where source is 'llm:<model>' or 'rules'."""
     if not items or not use_llm:
@@ -552,11 +569,11 @@ def advisor_tip(items, credit_info, base_url, model, use_llm, warnings) -> tuple
             "Give ONE specific, actionable tip (max 2 sentences) that targets the largest item. "
             "Do not write any dollar amounts or percentages that are not listed above, and do not "
             "name any instance type that is not listed above.")
-
+ 
     prompt, invented = head + "\n\nTip:", set()
     for _ in range(2):  # one retry: weak models often fix this when told what went wrong
         try:
-            tip = ollama_generate(base_url, model, prompt, timeout=120).strip()
+            tip = " ".join(ollama_generate(base_url, model, prompt, timeout=120).split())
         except LLMError as e:
             warnings.append(f"Advisor LLM unavailable ({e}); used rule-based tip.")
             return fallback_tip(items), "rules"
@@ -575,20 +592,19 @@ def advisor_tip(items, credit_info, base_url, model, use_llm, warnings) -> tuple
     flagged = sorted(invented | bad_types)
     warnings.append(f"Advisor LLM tip rejected twice (unverified: {flagged or 'empty answer'}); used rule-based tip.")
     return fallback_tip(items), "rules"
-
-
-
-
-
+ 
+ 
+ 
+ 
 # Report + CLI
-
-
-
-
+ 
+ 
+ 
+ 
 def money(x) -> str:
     return "?" if x is None else f"${x:,.2f}"
-
-
+ 
+ 
 def generate_report(c, items, unknown, excluded, oop, total_all, tip, tip_src, warnings, skipped, model) -> str:
     L = ["## AWS Activate Credit Burner Report", "",
          f"**Starting credits:** {money(c['credits'])}",
@@ -631,8 +647,8 @@ def generate_report(c, items, unknown, excluded, oop, total_all, tip, tip_src, w
           f"*All dollar figures above are computed by code from live pricing or labelled estimates; "
           f"the AI model ({model}) only writes the tip.*", ""]
     return "\n".join(L)
-
-
+ 
+ 
 def parse_args():
     p = argparse.ArgumentParser(description="Predict how long your cloud credits will last.")
     p.add_argument("--credits", type=float, required=True, help="Remaining credit balance in USD")
@@ -649,9 +665,10 @@ def parse_args():
     p.add_argument("--cache-file", default=".price_cache.json")
     p.add_argument("--out", default="report.md", help="Markdown report path")
     p.add_argument("--json", action="store_true", help="Print machine-readable JSON to stdout (for CI)")
+    p.add_argument("--json-out", help="Write the machine-readable JSON to this file (UTF-8, no shell redirect needed)")
     return p.parse_args()
-
-
+ 
+ 
 def run(args) -> int:
     load_dotenv()
     url = args.ollama_url if args.ollama_url.startswith("http") else "http://" + args.ollama_url
@@ -663,7 +680,7 @@ def run(args) -> int:
             expires = datetime.strptime(args.expires, "%Y-%m-%d").date()
         except ValueError as e:
             raise FatalError("--expires must look like 2027-06-30") from e
-
+ 
     warnings: list[str] = []
     skipped: set[str] = set()
     path = Path(args.file) if args.file else None
@@ -683,14 +700,14 @@ def run(args) -> int:
         raise FatalError(str(e)) from e
     if not resources:
         raise FatalError("No billable resources found in the input.")
-
+ 
     api_key = os.getenv("INFRACOST_API_KEY")
     if not api_key and any(r.kind in ("ec2", "rds") for r in resources):
         log("Warning: INFRACOST_API_KEY missing; EC2/RDS will only price from cache.")
     pricer = Pricer(api_key, None if args.no_cache else Path(args.cache_file))
     for r in resources:
         pricer.price(r)
-
+ 
     priced = sorted((r for r in resources if r.monthly is not None), key=lambda r: r.monthly, reverse=True)
     unknown = [r for r in resources if r.monthly is None]
     excluded = {k.strip() for k in args.exclude.split(",") if k.strip()}
@@ -699,26 +716,29 @@ def run(args) -> int:
     credit_info = analyze_credits(args.credits, total_all - oop, expires, date.today())
     if unknown:
         warnings.append("Unpriced: " + "; ".join(f"{r.name} ({r.note or 'unknown'})" for r in unknown))
-
+ 
     tip, tip_src = advisor_tip(priced, credit_info, url, args.model, not args.no_llm, warnings)
     report = generate_report(credit_info, priced, unknown, excluded, oop, total_all, tip, tip_src,
                              warnings, skipped, args.model)
     Path(args.out).write_text(report, encoding="utf-8")
-
+ 
+    payload = {"credits": credit_info, "total_monthly": round(total_all, 2),
+               "out_of_pocket_monthly": round(oop, 2),
+               "resources": [r.to_dict() for r in priced + unknown],
+               "unpriced_types": sorted(skipped), "warnings": warnings,
+               "tip": {"text": tip, "source": tip_src}}
+    if args.json_out:
+        Path(args.json_out).write_text(json.dumps(payload, indent=2), encoding="utf-8")
     if args.json:
-        print(json.dumps({"credits": credit_info, "total_monthly": round(total_all, 2),
-                          "out_of_pocket_monthly": round(oop, 2),
-                          "resources": [r.to_dict() for r in priced + unknown],
-                          "unpriced_types": sorted(skipped), "warnings": warnings,
-                          "tip": {"text": tip, "source": tip_src}}, indent=2))
+        print(json.dumps(payload, indent=2))
     else:
         print(report)
         log(f"\nDone. Report saved to {args.out}.")
     return 0
-
-
+ 
+ 
 def main() -> int:
-    for stream in (sys.stdout, sys.stderr): 
+    for stream in (sys.stdout, sys.stderr):  # Windows consoles default to cp1252, which cannot print emoji
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8", errors="replace")
     try:
@@ -726,7 +746,7 @@ def main() -> int:
     except FatalError as e:
         log(f"Error: {e}")
         return 1
-
-
+ 
+ 
 if __name__ == "__main__":
     sys.exit(main())
