@@ -4,7 +4,7 @@ provider "aws" {
 
 resource "aws_instance" "backend_api" {
   ami           = "ami-0c55b159cbfafe1f0"
-  instance_type = "t3.large"
+  instance_type = "t3.xlarge"
 }
 
 resource "aws_db_instance" "primary_db" {
@@ -12,5 +12,7 @@ resource "aws_db_instance" "primary_db" {
   instance_class    = "db.r5.large"
   allocated_storage = 20
 }
+
+resource "aws_lb" "app" {}
 
 resource "aws_nat_gateway" "nat" {}
