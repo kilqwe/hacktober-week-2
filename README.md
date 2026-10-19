@@ -135,7 +135,3 @@ A friend's Terraform project (11 files: ECS Fargate service, ALB, one EC2 instan
 - Price-check any instance type a tip names.
 - Golden tests: hand-priced sample stacks checked against the AWS Pricing Calculator, plus a coverage score (share of cost priced live, estimated or unpriced).
 - Package the Action so other repos can use it with one `uses:` line, and run it from the base branch for security.
-
-## License
-
-Add a license file (MIT is a common choice for Hacktoberfest projects).
