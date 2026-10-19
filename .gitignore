@@ -1,3 +1,6 @@
 .env
 venv
 .price_cache.json
+stack
+stack.json
+__pycache__
