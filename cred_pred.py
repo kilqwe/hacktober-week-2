@@ -39,6 +39,7 @@ FLAT = {
     "eks_cluster": (0.10 * HOURS_PER_MONTH, "control plane only; worker nodes priced separately"),
 }
 EBS_PER_GB = {"gp3": 0.08, "gp2": 0.10, "io1": 0.125, "io2": 0.125, "st1": 0.045, "sc1": 0.015, "standard": 0.05}
+FARGATE_RATES = {"X86_64": (0.04048, 0.004445), "ARM64": (0.03238, 0.00356)}  # (per vCPU-hour, per GB-hour), us-east-1
 RDS_PER_GB = 0.115  # gp3 single-AZ; doubled for multi-AZ
 RDS_ENGINES = {"postgres": "PostgreSQL", "postgresql": "PostgreSQL", "mysql": "MySQL", "mariadb": "MariaDB",
                "aurora-postgresql": "Aurora PostgreSQL", "aurora-mysql": "Aurora MySQL", "aurora": "Aurora MySQL"}
@@ -57,7 +58,9 @@ FREE = ("aws_vpc", "aws_subnet", "aws_security_group", "aws_route", "aws_interne
         "aws_key_pair", "aws_network_acl", "aws_lb_listener", "aws_lb_target_group", "aws_alb_",
         "aws_db_subnet_group", "aws_db_parameter_group", "aws_eip_association", "aws_launch_template",
         "aws_cloudwatch_log_group", "aws_ssm_parameter", "aws_default_", "aws_volume_attachment",
-        "aws_ebs_volume_attachment", "aws_main_route_table_association")
+        "aws_ebs_volume_attachment", "aws_main_route_table_association", "aws_acm_certificate",
+        "aws_cloudfront_origin_access_control", "aws_s3_bucket_policy", "aws_s3_bucket_public_access_block",
+        "aws_appautoscaling_", "aws_ecs_cluster", "aws_network_interface")
  
  
 def log(msg: str) -> None:
@@ -87,6 +90,10 @@ class Resource:
     unit_monthly: float | None = None  # per unit; None = unknown
     price_source: str = "unknown"  # live | cache | estimate | unknown
     note: str = ""
+    vcpu: float = 0.0  # Fargate tasks only
+    mem_gb: float = 0.0
+    arch: str = ""
+    spot: bool = False
  
     @property
     def monthly(self) -> float | None:
@@ -199,11 +206,53 @@ def components_for(rtype, name, cfg, region, qty, variables, warnings, skipped, 
               "aws_eip": "elastic_ip", "aws_eks_cluster": "eks_cluster"}
     if rtype in simple:
         return [res(simple[rtype])]
+    if rtype in ("aws_ecs_task_definition", "aws_ecs_service"):
+        return []  # priced together by fargate_components()
     if rtype == "aws_rds_cluster":
         return []  # priced via its aws_rds_cluster_instance children
     if rtype.startswith("aws_") and not rtype.startswith(FREE):
         skipped.add(rtype)
     return []
+ 
+ 
+def fargate_components(task_defs, services, region, variables, warnings, max_tasks=None) -> list[Resource]:
+    """ECS services on Fargate: price each service's tasks from its task definition's CPU and memory."""
+    out: list[Resource] = []
+    for addr, cfg in services:
+        ref = str(clean(cfg.get("task_definition")) or "")
+        m = re.search(r"aws_ecs_task_definition\.(\w+)", ref)
+        td = task_defs.get(m.group(1)) if m else (next(iter(task_defs.values())) if len(task_defs) == 1 else None)
+        if td is None:
+            warnings.append(f"{addr}: could not find its task definition; not priced")
+            continue
+        compat = [str(clean(x)).upper() for x in (td.get("requires_compatibilities") or [])]
+        if "FARGATE" not in compat:
+            warnings.append(f"{addr}: not a Fargate service; its cost is the cost of the EC2 instances it runs on")
+            continue
+        cpu, mem = to_int(resolve(td.get("cpu"), variables)), to_int(resolve(td.get("memory"), variables))
+        if not cpu or not mem:
+            warnings.append(f"{addr}: task cpu/memory not resolvable (variable without a default?); not priced")
+            continue
+        count = to_int(resolve(cfg.get("desired_count"), variables))
+        if count is None:
+            warnings.append(f"{addr}: desired_count not resolvable, assuming 1")
+            count = 1
+        arch = str(clean(first_block(td.get("runtime_platform")).get("cpu_architecture")) or "X86_64").upper()
+        if arch not in FARGATE_RATES:
+            arch = "X86_64"
+        strategy = cfg.get("capacity_provider_strategy") or []
+        strategy = strategy if isinstance(strategy, list) else [strategy]
+        spot = any("SPOT" in str(clean(c.get("capacity_provider", ""))).upper() for c in strategy if isinstance(c, dict))
+        vcpu, gb = cpu / 1024, mem / 1024
+        out.append(Resource("fargate_task", addr, region, count, vcpu=vcpu, mem_gb=gb, arch=arch, spot=spot,
+                            instance_type=f"{vcpu:g} vCPU / {gb:g} GB {arch}"))
+        public = resolve(first_block(cfg.get("network_configuration")).get("assign_public_ip"), variables)
+        if str(public).lower() == "true":
+            out.append(Resource("elastic_ip", f"{addr} (task public IPv4)", region, count))
+        if max_tasks and max_tasks > count:
+            warnings.append(f"{addr}: priced at {count} task(s); autoscaling can scale up to {max_tasks}, "
+                            f"and the cost scales with it")
+    return out
  
  
 def extract_from_hcl(text, default_region, warnings, skipped) -> list[Resource]:
@@ -234,26 +283,46 @@ def extract_from_hcl(text, default_region, warnings, skipped) -> list[Resource]:
         warnings.append(f"{len(parsed['module'])} module block(s) are not expanded, so resources inside them are "
                         f"NOT counted. Use plan JSON (`terraform show -json`) for exact results.")
     out: list[Resource] = []
+    seen: set[str] = set()
+    task_defs: dict = {}
+    services: list = []
+    autoscale_max: list = []
     for block in parsed.get("resource", []):
         for rtype, instances in block.items():
             for name, cfg in instances.items():
                 rtype, name = clean(rtype), clean(name)
                 if not isinstance(cfg, dict):
                     continue
+                if rtype == "aws_ecs_task_definition":
+                    task_defs[name] = cfg
+                elif rtype == "aws_ecs_service":
+                    services.append((f"{rtype}.{name}", cfg))
+                elif rtype == "aws_appautoscaling_target":
+                    autoscale_max.append(to_int(resolve(cfg.get("max_capacity"), variables)))
+                notes: list[str] = []  # only shown if this resource turns out to be priced
+                if f"{rtype}.{name}" in seen:
+                    notes.append(f"{rtype}.{name} is defined more than once (the same resources in two .tf files?). "
+                                 f"Terraform would reject this; its cost is counted twice here.")
+                seen.add(f"{rtype}.{name}")
                 if "for_each" in cfg:
-                    warnings.append(f"{rtype}.{name}: for_each not expanded, counted once "
-                                    f"(use `terraform show -json` plan output for exact counts)")
+                    notes.append(f"{rtype}.{name}: for_each not expanded, counted once "
+                                 f"(use `terraform show -json` plan output for exact counts)")
                 if "dynamic" in cfg:
-                    warnings.append(f"{rtype}.{name}: dynamic blocks are not expanded; costs may be understated")
+                    notes.append(f"{rtype}.{name}: dynamic blocks are not expanded; costs may be understated")
                 if "provider" in cfg:
-                    warnings.append(f"{rtype}.{name}: provider alias ignored, using {region}")
+                    notes.append(f"{rtype}.{name}: provider alias ignored, using {region}")
                 qty = 1
                 if "count" in cfg:
                     qty = to_int(resolve(cfg["count"], variables))
                     if qty is None:
-                        warnings.append(f"{rtype}.{name}: count not resolvable, assuming 1")
+                        notes.append(f"{rtype}.{name}: count not resolvable, assuming 1")
                         qty = 1
-                out += components_for(rtype, name, cfg, region, qty, variables, warnings, skipped)
+                comps = components_for(rtype, name, cfg, region, qty, variables, warnings, skipped)
+                if comps:
+                    warnings.extend(notes)
+                out += comps
+    out += fargate_components(task_defs, services, region, variables, warnings,
+                              max((m for m in autoscale_max if m), default=None))
     return out
  
  
@@ -271,12 +340,24 @@ def extract_from_plan(text, default_region, warnings, skipped) -> list[Resource]
         region = default_region
  
     out: list[Resource] = []
+    task_defs: dict = {}
+    services: list = []
+    autoscale_max: list = []
     for rc in plan["resource_changes"]:
         change = rc.get("change", {})
         if change.get("actions") == ["delete"] or not isinstance(change.get("after"), dict):
             continue
-        out += components_for(rc.get("type", ""), rc.get("name", ""), change["after"], region, 1, {},
+        rtype, after = rc.get("type", ""), change["after"]
+        if rtype == "aws_ecs_task_definition":
+            task_defs[rc.get("name", "")] = after
+        elif rtype == "aws_ecs_service":
+            services.append((rc.get("address", ""), after))
+        elif rtype == "aws_appautoscaling_target":
+            autoscale_max.append(to_int(after.get("max_capacity")))
+        out += components_for(rtype, rc.get("name", ""), after, region, 1, {},
                               warnings, skipped, addr=rc.get("address"))
+    out += fargate_components(task_defs, services, region, {}, warnings,
+                              max((m for m in autoscale_max if m), default=None))
     return out
  
  
@@ -391,6 +472,11 @@ class Pricer:
     def _estimate(self, r: Resource) -> None:
         if r.kind in FLAT:
             unit, note = FLAT[r.kind]
+        elif r.kind == "fargate_task":
+            rate_cpu, rate_gb = FARGATE_RATES[r.arch]
+            unit = (r.vcpu * rate_cpu + r.mem_gb * rate_gb) * HOURS_PER_MONTH
+            note = "on-demand Fargate rate, vCPU and memory only" + (
+                "; this stack uses Spot, which is cheaper, so this is an upper bound" if r.spot else "")
         elif r.size_gb <= 0:
             r.note = "size unknown or from a variable - not priced"
             return
@@ -519,6 +605,7 @@ TIPS = {
     "eks_cluster": "The EKS control plane costs the same when idle. Share one cluster across environments using namespaces.",
     "ebs": "Volumes bill whether or not they are attached. Delete orphaned volumes and move gp2 to gp3.",
     "elastic_ip": "Public IPv4 addresses are billed hourly. Release unused Elastic IPs.",
+    "fargate_task": "Fargate bills for the CPU and memory you reserve, not what you use. Right-size the task from CloudWatch metrics, and use Graviton (ARM) and Fargate Spot where interruptions are acceptable.",
 }
  
  
@@ -623,6 +710,9 @@ def generate_report(c, items, unknown, excluded, oop, total_all, tip, tip_src, w
                  f"You would need to spend ~{money(c['needed_monthly_to_use_all'])}/mo to use them all before expiry.")
     elif c["status"] == "runs_out_first" and c["expires"]:
         L.append("> Credits will be used up before they expire.")
+    if skipped:
+        L.append(f"> **Warning:** these resource types are not priced and are NOT in the total: "
+                 f"{', '.join(sorted(skipped))}. The real burn is higher, so this runway is an upper bound.")
     if unknown:
         L.append(f"> **Warning:** {len(unknown)} item(s) could not be priced and are **not** in the total, "
                  f"so the real runway is **shorter** than shown.")
@@ -653,11 +743,11 @@ def parse_args():
     p = argparse.ArgumentParser(description="Predict how long your cloud credits will last.")
     p.add_argument("--credits", type=float, required=True, help="Remaining credit balance in USD")
     src = p.add_mutually_exclusive_group(required=True)
-    src.add_argument("--file", help=".tf (Terraform), .json (terraform show -json), or .txt (plain English)")
+    src.add_argument("--file", help=".tf file, a folder of .tf files, .json (terraform show -json), or .txt (plain English)")
     src.add_argument("--describe", help='Plain English, e.g. "2 t3.medium and a db.t3.small postgres"')
     p.add_argument("--expires", help="Credit expiry date, YYYY-MM-DD")
     p.add_argument("--region", default="us-east-1", help="Default region when not found in the input")
-    p.add_argument("--model", default="gemma2:2b", help="Ollama model (gemma2:2b, llama3.2:3b, qwen2.5:3b...)")
+    p.add_argument("--model", default="gemma3:4b", help="Ollama model (gemma3:4b, llama3.2:3b, qwen2.5:3b...)")
     p.add_argument("--ollama-url", default=os.getenv("OLLAMA_HOST", "http://localhost:11434"))
     p.add_argument("--exclude", default="", help="Comma-separated kinds NOT covered by credits (e.g. rds,ebs)")
     p.add_argument("--no-llm", action="store_true", help="Skip the advisor LLM (plain-English input still needs it)")
@@ -688,7 +778,14 @@ def run(args) -> int:
     try:
         if path and not path.exists():
             raise FatalError(f"File not found: {path}")
-        if suffix == ".tf":
+        if path and path.is_dir():  # a whole Terraform folder: read every .tf file in it, like terraform does
+            tf_files = sorted(path.glob("*.tf"))
+            if not tf_files:
+                raise FatalError(f"No .tf files found in folder: {path}")
+            log(f"Reading {len(tf_files)} .tf files: " + ", ".join(f.name for f in tf_files))
+            resources = extract_from_hcl("\n".join(f.read_text(encoding="utf-8") for f in tf_files),
+                                         args.region, warnings, skipped)
+        elif suffix == ".tf":
             resources = extract_from_hcl(path.read_text(encoding="utf-8"), args.region, warnings, skipped)
         elif suffix == ".json":
             resources = extract_from_plan(path.read_text(encoding="utf-8"), args.region, warnings, skipped)
@@ -699,7 +796,9 @@ def run(args) -> int:
     except LLMError as e:
         raise FatalError(str(e)) from e
     if not resources:
-        raise FatalError("No billable resources found in the input.")
+        hint = (f" This tool does not price these resource types yet: {', '.join(sorted(skipped))}."
+                if skipped else "")
+        raise FatalError("No billable resources found in the input." + hint)
  
     api_key = os.getenv("INFRACOST_API_KEY")
     if not api_key and any(r.kind in ("ec2", "rds") for r in resources):
