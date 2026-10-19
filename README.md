@@ -1,4 +1,4 @@
-# cred_pred
+# Cred_Pred (A Credit Burn Analyzer)
 
 Know when your cloud credits will run out before they do.
 
